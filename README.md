@@ -47,6 +47,8 @@ FOGO는 Pleos Connect(Android Automotive)용 차량 앱입니다. 주행한 길�
 | APK | [`apk/DriveAtlas_FOGO_release.apk`](apk/DriveAtlas_FOGO_release.apk) (release 빌드, 에뮬레이터 설치용 디버그 키 서명) |
 | 패키지 | `com.ssafy.fogo` · minSdk 28 · targetSdk 34 |
 | 테스트 환경 | Pleos Connect v2.1.0 AVD(x86_64, API 34, `Pleos_Connect_API_34`), Windows 11, JDK 21, Gradle 9.4.1, AGP 9.2.1 |
+| 에뮬레이터·화면 규격 | Pleos Connect v2.1.0 시스템 이미지(`pleos_car_emulator`, x86_64, API 34), 화면 2560×1440 px · 160 dpi(mdpi) 가로, RAM 6GB. FOGO는 Pleos 화면 오른쪽 앱 영역(약 1680×1208 px)에 표시되며 세로 배치와 주간·야간 테마에도 대응 |
+| 필요한 설정 | 첫 실행 시 위치·알림 권한과 Pleos 위치 권한 허용. 차량 신호를 쓰려면 `adb forward tcp:8088 tcp:8088` 후 Virtual Console 탭을 열어 둠(탭을 닫으면 `emulator_inactive`). 인터넷이 없어도 도시 예시 재생은 동작 |
 | 차량 신호 | Virtual Console(`http://127.0.0.1:8088`)의 기어·속도·와이퍼·문·주행거리, `adb emu geo fix`로 위치 |
 
 ```powershell
