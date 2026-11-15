@@ -49,7 +49,7 @@ FOGO는 Pleos Connect(Android Automotive)용 차량 앱입니다. 주행한 길�
 | APK | [`apk/DriveAtlas_FOGO_release.apk`](apk/DriveAtlas_FOGO_release.apk) (release 빌드, 에뮬레이터 설치용 디버그 키 서명) |
 | 패키지 | `com.ssafy.fogo` · minSdk 28 · targetSdk 34 |
 | 테스트 환경 | Pleos Connect v2.1.0 AVD(x86_64, API 34, `Pleos_Connect_API_34`), Windows 11, JDK 21, Gradle 9.4.1, AGP 9.2.1 |
-| 에뮬레이터·화면 규격 | Pleos Connect v2.1.0 시스템 이미지(`pleos_car_emulator`, x86_64, API 34), 화면 2560×1440 px · 160 dpi(mdpi) 가로, RAM 6GB. FOGO는 Pleos 화면 오른쪽 앱 영역(약 1680×1208 px)에 표시되며 세로 배치와 주간·야간 테마에도 대응 |
+| 에뮬레이터·화면 규격 | Pleos Connect v2.1.0 시스템 이미지(`pleos_car_emulator`, x86_64, API 34), 화면 2560×1440 px · 160 dpi(mdpi) 가로, RAM 6GB. FOGO는 Pleos 화면 오른쪽 앱 영역(약 1680×1208 px)에 표시되며 주간·야간 테마에 대응 |
 | 필요한 설정 | 첫 실행 시 위치·알림 권한과 Pleos 위치 권한 허용. 차량 신호를 쓰려면 `adb forward tcp:8088 tcp:8088` 후 Virtual Console 탭을 열어 둠(탭을 닫으면 `emulator_inactive`). 인터넷이 없어도 도시 예시 재생은 동작 |
 | 차량 신호 | Virtual Console(`http://127.0.0.1:8088`)의 기어·속도·와이퍼·문·주행거리, `adb emu geo fix`로 위치 |
 
@@ -120,7 +120,7 @@ Virtual Console 페이지는 열리지만 차량 제어가 `503 emulator_inactiv
 2. 강릉 경포대, 서울 경복궁, 부산 해운대해수욕장 등 명소 9곳 중 하나를 고른 뒤 `주행 재생`을 누릅니다. 약 6초 후 도착 티켓이 뜹니다. 재생은 실제 조명을 변경하지 않고 도착 화면에 도시 색을 표시합니다.
 3. 도착 탑승권에서 `지도판에 붙이기`를 선택하고, 아이템과 열린 빈 칸을 고른 뒤 `여기 붙이기`를 누릅니다. 같은 시·도의 명소 3곳을 처음 방문하면 자석도 배치할 수 있습니다.
 4. `차고 → 공방 가기`에서 코스튬을 제작하고 `입히기`로 장착합니다. `기록 이어받기(시연)`로 차를 바꾸고 이전 탑승권과 티켓북을 확인합니다.
-5. 발표 전 반복 연습에는 `시연 설정 → 시연 기록 초기화`를 사용합니다. 이 메뉴는 에뮬레이터용 디버그 APK에서 표시됩니다.
+5. 발표 전 반복 연습에는 `시연 설정 → 시연 기록 초기화`를 사용합니다. 이 메뉴는 에뮬레이터에서만 표시됩니다(release APK 포함, 실차에서는 숨김).
 
 기본 음성은 Pleos 차량 내 한국어 합성입니다. 설정에서 Pleos My Project 자격 증명을 입력하면 해당 앱 프로세스에서 하이브리드 음성을 사용할 수 있습니다. 자격 증명은 APK·파일·앱 설정에 저장하지 않습니다. SDK 재생이 시작되지 않으면 한국어 내장 음원을 재생합니다.
 
