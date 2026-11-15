@@ -1,0 +1,550 @@
+package com.ssafy.fogo
+
+import android.Manifest
+import android.app.Activity
+import android.app.AlertDialog
+import android.content.Intent
+import android.content.pm.PackageManager.PERMISSION_GRANTED
+import android.os.Bundle
+import android.view.Gravity
+import android.view.View
+import android.widget.EditText
+import android.widget.FrameLayout
+import android.widget.ImageView
+import android.widget.LinearLayout
+import android.widget.ScrollView
+
+enum class Page(val title: String) {
+    SPLASH("FOGO"), INTRO("FOGO"), CONSENT("위치 기록 동의"), MASCOT("같이 달릴 친구"), ATLAS("아틀라스"),
+    JOURNEY("목적지 미리보기"), ARRIVAL("도착 탑승권"), BOARD("아틀라스"), PLACE("스티커·자석 붙이기"),
+    REGION("시·도 상세"), GARAGE("차고"), WORKSHOP("공방"), DRESS("입히기"),
+    RECAP("리캡"), BOOK("월간 티켓북"), TRANSFER("새 차로 이어가기"), SETTINGS("시연 설정"),
+    FRIENDS("친구"), FRIEND("친구 지도판"),
+}
+
+class MainActivity : Activity() {
+    val fogo get() = application as FogoApplication
+    val profile get() = fogo.profile
+    val catalog get() = fogo.catalog
+    val art get() = fogo.art
+    lateinit var ui: AtlasUi
+        private set
+    val colors get() = ui.colors
+    private lateinit var journey: JourneyScreens
+    private lateinit var collection: CollectionScreens
+    private lateinit var friends: FriendScreens
+    var page = Page.ATLAS
+        private set
+    private var arrivalSeen: String? = null
+    private var permissionDenied = false
+    private var permissionFromOnboarding = false
+    private var dialog: AlertDialog? = null
+    private var notice: View? = null
+    private var scroll: ScrollView? = null
+    private var lastPage: Page? = null
+    /** Opening video screen, kept across redraws so location/gear updates do not restart the clip. */
+    private var splash: IntroSplash? = null
+    /** True while the current render is the first one for [page]; screens use it for entrance motion. */
+    var entering = false
+        private set
+    private val themePreferences by lazy { getSharedPreferences("fogo_appearance", MODE_PRIVATE) }
+    /** Whether location was ever requested, to tell a first request from a "다시 묻지 않음" denial. */
+    private val permissionPreferences by lazy { getSharedPreferences("fogo_permissions", MODE_PRIVATE) }
+    private var themeOverride: Boolean? = null
+    private val mainTabs = listOf(Page.ATLAS, Page.GARAGE, Page.FRIENDS, Page.RECAP, Page.SETTINGS)
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        // Every fresh launch opens on the intro video; the 시작하기 button then leads on.
+        page = savedInstanceState?.getString("page")?.let(Page::valueOf) ?: Page.SPLASH
+        arrivalSeen = savedInstanceState?.getString("arrivalSeen")
+        permissionDenied = savedInstanceState?.getBoolean("permissionDenied") == true
+        permissionFromOnboarding = savedInstanceState?.getBoolean("permissionFromOnboarding") == true
+        themeOverride = themePreferences.getString("demoTheme", null)?.toBooleanStrictOrNull()
+        journey = JourneyScreens(this, savedInstanceState)
+        collection = CollectionScreens(this, savedInstanceState)
+        friends = FriendScreens(this, savedInstanceState)
+    }
+
+    override fun onStart() {
+        super.onStart()
+        fogo.redraw = ::render
+        fogo.say = ::message
+        fogo.applyLiveTags()
+        render()
+        fogo.refreshDestination()
+    }
+
+    override fun onStop() {
+        fogo.redraw = null
+        fogo.say = null
+        dialog?.dismiss()
+        super.onStop()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putString("page", page.name)
+        outState.putString("arrivalSeen", arrivalSeen)
+        outState.putBoolean("permissionDenied", permissionDenied)
+        outState.putBoolean("permissionFromOnboarding", permissionFromOnboarding)
+        journey.save(outState)
+        collection.save(outState)
+        friends.save(outState)
+        super.onSaveInstanceState(outState)
+    }
+
+    override fun onBackPressed() {
+        if (!fogo.parked || page in mainTabs || page == Page.INTRO || page == Page.SPLASH) super.onBackPressed()
+        else go(parentPage())
+    }
+
+    fun go(next: Page) {
+        if (!fogo.parked) return
+        page = next
+        render()
+    }
+
+    private fun parentPage() = when (page) {
+        Page.CONSENT -> Page.SPLASH
+        Page.MASCOT -> if (profile.onboarded) Page.GARAGE else Page.CONSENT
+        Page.PLACE -> Page.BOARD
+        Page.WORKSHOP, Page.DRESS, Page.TRANSFER -> Page.GARAGE
+        Page.BOOK -> Page.RECAP
+        Page.FRIEND -> Page.FRIENDS
+        else -> Page.ATLAS
+    }
+
+    fun render() {
+        val now = fogo.trip.arrival?.city
+        if (now == null) {
+            arrivalSeen = null
+            // The ticket's trip is gone (실제 차량 모드로 돌아가기, reset): the headerless, rail-less ARRIVAL frame
+            // would be left with no way to the other tabs, so fall back to the destination screen.
+            if (page == Page.ARRIVAL) page = Page.JOURNEY
+        } else if (fogo.parked && profile.onboarded && arrivalSeen != now.spotId) {
+            page = Page.ARRIVAL
+            journey.focus(now)
+            arrivalSeen = now.spotId
+        }
+
+        val config = resources.configuration
+        val wide = config.screenWidthDp >= 760 && config.screenWidthDp > config.screenHeightDp
+        // Figma frames are 1700 (wide) / 840 (portrait) units across; grow toward them on large Pleos displays.
+        // At 1,700 dp wide (Pleos Connect) this makes 1 Figma px ≈ 1 dp: 40 px titles, 100 px buttons.
+        val scale = if (wide) (config.screenWidthDp / 1000f).coerceIn(1f, 1.7f)
+            else (config.screenWidthDp / 500f).coerceIn(1f, 1.6f)
+        ui = AtlasUi(this, AtlasColors(themeOverride ?: fogo.trip.scene.night), wide, scale)
+        window.statusBarColor = colors.navy
+        window.navigationBarColor = colors.navy
+        if (!fogo.parked) {
+            splash = null
+            dialog?.dismiss()
+            lastPage = null
+            scroll = null
+            driving()
+            return
+        }
+
+        if (page == Page.SPLASH) {
+            val view = splash ?: IntroSplash(this, ::leaveSplash).also { splash = it }
+            if (view.parent == null) setContentView(view)
+            lastPage = page
+            return
+        }
+        splash = null
+
+        entering = page != lastPage
+        val oldScroll = if (page == lastPage) scroll?.scrollY ?: 0 else 0
+        val root = ui.column().apply { setBackgroundColor(colors.background) }
+        val usesRail = page in mainTabs || page in setOf(Page.JOURNEY, Page.BOARD, Page.REGION, Page.FRIEND)
+        if (wide && usesRail) {
+            val row = ui.row().apply { gravity = Gravity.TOP }
+            val content = ui.column()
+            row.addView(rail(), LinearLayout.LayoutParams(ui.dp(110), -1))
+            row.addView(content, LinearLayout.LayoutParams(0, -1, 1f))
+            root.addView(row, LinearLayout.LayoutParams(-1, -1))
+            header(content)
+            content(content, oldScroll)
+        } else {
+            // Figma T1: the arrival ticket sits on a full-screen dim, no header.
+            if (page != Page.ARRIVAL) header(root)
+            if (usesRail) {
+                val tabs = ui.column().apply {
+                    setBackgroundColor(colors.yellow)
+                    setPadding(ui.dp(14), ui.dp(7), ui.dp(14), 0)
+                }
+                root.addView(tabs)
+                ui.strip(tabs, mainTabs.map { it.title to { go(it) } }, tabForPage().title)
+            }
+            content(root, oldScroll)
+        }
+        lastPage = page
+        setContentView(root)
+        if (fogo.notices.isNotEmpty()) root.post(::showNextNotice)
+    }
+
+    /** 시작하기 on the intro: new drivers go through consent and mascot, returning ones straight to the atlas. */
+    private fun leaveSplash() {
+        if (!fogo.parked) return
+        splash = null
+        page = if (profile.onboarded) Page.ATLAS else Page.CONSENT
+        render()
+    }
+
+    /** One waiting notice (차 생일, 출퇴근 완료, 친구 수락) as a sheet, only on a parked, settled screen. */
+    private fun showNextNotice() {
+        if (!fogo.parked || dialog?.isShowing == true || !profile.onboarded ||
+            page in setOf(Page.SPLASH, Page.INTRO, Page.CONSENT, Page.MASCOT, Page.ARRIVAL)) return
+        val notice = fogo.notices.removeFirstOrNull() ?: return
+        val target = notice.target
+        showSheet(notice.tag, notice.title, notice.message, actions = listOfNotNull(
+            Act("확인", target == null) {},
+            target?.let { Act(notice.action ?: "보러 가기", true, weight = 1.4f) { go(it) } }))
+        notice.speak?.let(fogo::speak)
+    }
+
+    /**
+     * 폰으로 보내기 (Figma S1): a QR the phone camera reads. With no server yet the QR carries the summary text
+     * itself; the service would carry a link to the image. Blocks are never in it, so 집·회사 stay out.
+     */
+    fun share(title: String, summary: String) {
+        val body = ui.row().apply { gravity = Gravity.CENTER_VERTICAL }
+        val size = ui.dp(if (ui.wide) 260 else 200)
+        body.addView(ImageView(this).apply {
+            setImageBitmap(Qr.bitmap(summary, size))
+            contentDescription = "공유 QR"
+        }, LinearLayout.LayoutParams(size, size))
+        val words = ui.column()
+        body.addView(words, LinearLayout.LayoutParams(0, -2, 1f).apply { marginStart = ui.dp(20) })
+        words.addView(ui.label(summary, 17f, colors.ink))
+        words.addView(ui.label("시연: QR에 요약 글이 들어 있어요. 서비스에서는 이미지 링크가 들어가요.", 14f, colors.muted),
+            LinearLayout.LayoutParams(-2, -2).apply { topMargin = ui.dp(12) })
+        showSheet("SHARE", title, "폰 카메라로 찍으면 저장할 수 있어요", body, listOf(Act("닫기", true) {}), width = ui.fx(1100))
+    }
+
+    /** What a shared 지도판 says: car, fog lifted, stickers, and each 시·도's 명소 — no blocks or places. */
+    fun boardSummary(): String {
+        val stickers = catalog.boardItems.count { !it.magnet && profile.owns(it.id) }
+        val magnets = catalog.boardItems.count { it.magnet && profile.owns(it.id) }
+        val regions = catalog.regions.joinToString(" · ") { "${it.name} ${it.opened(profile)}/${it.spots.size}" }
+        return "FOGO 지도판\n${profile.car} · ${profile.mascot}\n걷힌 안개 ${profile.blocks.size}칸 · 스티커 $stickers · 자석 $magnets\n" +
+            "명소 $regions\n#FOGO #Pleos"
+    }
+
+    private fun tabForPage() = when (page) {
+        in mainTabs -> page
+        Page.FRIEND -> Page.FRIENDS
+        else -> Page.ATLAS
+    }
+
+    private fun rail(): View {
+        val container = FrameLayout(this)
+        val rail = ui.column().apply {
+            setBackgroundColor(colors.yellow)
+            setPadding(ui.dp(12), ui.dp(24), ui.dp(15), ui.dp(18))
+        }
+        container.addView(rail, FrameLayout.LayoutParams(-1, -1))
+        ui.text(rail, "FOGO", 19f, colors.dark, pixel = true).gravity = Gravity.CENTER
+        val icons = listOf(PixelIconView.ATLAS, PixelIconView.GARAGE, PixelIconView.FRIENDS, PixelIconView.RECAP, PixelIconView.SETTINGS)
+        mainTabs.forEachIndexed { index, item ->
+            val selected = tabForPage() == item
+            val tab = ui.column().apply {
+                gravity = Gravity.CENTER
+                isClickable = true
+                contentDescription = item.title
+                background = if (selected) ui.box(colors.paper, shadow = true) else null
+                setPadding(0, ui.dp(10), 0, ui.dp(10))
+                setOnClickListener { go(item) }
+            }
+            tab.addView(PixelIconView(this, icons[index], if (selected) colors.ink else colors.dark),
+                LinearLayout.LayoutParams(ui.dp(34), ui.dp(34)).apply { bottomMargin = ui.dp(6) })
+            tab.addView(ui.label(item.title, 15f, if (selected) colors.ink else colors.dark, bold = true).apply {
+                gravity = Gravity.CENTER
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            })
+            rail.addView(tab, LinearLayout.LayoutParams(-1, -2).apply { topMargin = ui.dp(12) })
+        }
+        rail.addView(View(this), LinearLayout.LayoutParams(1, 0, 1f))
+        rail.addView(PixelIconView(this, BARCODE, colors.dark), LinearLayout.LayoutParams(-1, ui.dp(34)))
+        // Perforated seam between the stub (rail) and the ticket body.
+        val seam = DashedLine(this, colors.dark, ui.dp(10).toFloat(), ui.dp(7).toFloat())
+        container.addView(seam, FrameLayout.LayoutParams(ui.dp(3), -1, Gravity.END))
+        listOf(Gravity.TOP, Gravity.BOTTOM).forEach { edge ->
+            val notch = ImageView(this).apply {
+                setImageResource(if (colors.night) R.drawable.atlas_rail_night else R.drawable.atlas_rail_day)
+            }
+            container.addView(notch, FrameLayout.LayoutParams(ui.dp(26), ui.dp(26), edge or Gravity.END).apply {
+                topMargin = if (edge == Gravity.TOP) -ui.dp(13) else 0
+                bottomMargin = if (edge == Gravity.BOTTOM) -ui.dp(13) else 0
+                marginEnd = -ui.dp(13)
+            })
+        }
+        return container
+    }
+
+    private fun header(parent: LinearLayout) {
+        val bar = ui.row().apply {
+            setBackgroundColor(colors.navy)
+            minimumHeight = ui.dp(70)
+            setPadding(ui.dp(22), ui.dp(8), ui.dp(20), ui.dp(8))
+        }
+        parent.addView(bar, LinearLayout.LayoutParams(-1, -2))
+        // 지도판 is the second tab of 아틀라스 (Figma A2), so no back arrow there.
+        if (page !in mainTabs && page != Page.INTRO && page != Page.BOARD) {
+            val back = ui.action("←") { go(parentPage()) }.apply { contentDescription = "뒤로" }
+            bar.addView(back, LinearLayout.LayoutParams(ui.dp(55), -2).apply { marginEnd = ui.dp(10) })
+        }
+        val titles = if (ui.wide) ui.row() else ui.column()
+        bar.addView(titles, LinearLayout.LayoutParams(0, -2, 1f))
+        titles.addView(ui.label("FOGO PASS", 13f, colors.lime, pixel = true),
+            LinearLayout.LayoutParams(-2, -2).apply { if (ui.wide) marginEnd = ui.dp(14) })
+        titles.addView(ui.label(page.title, 25f, colors.white, bold = true))
+        if (fogo.replayCity != null) bar.addView(ui.label("시연 재생", 15f, colors.lime, bold = true))
+    }
+
+    private fun content(parent: LinearLayout, oldScroll: Int) {
+        // Figma frames: content 40 px in from the rail, 8 px under the header.
+        val body = ui.column().apply { setPadding(ui.fx(40), ui.fx(8), ui.fx(40), ui.fx(20)) }
+        val window = ScrollView(this).apply { isFillViewport = true; addView(body) }
+        parent.addView(window, LinearLayout.LayoutParams(-1, 0, 1f))
+        scroll = window
+        if (fogo.trip.storageFailed) ui.text(body, "기기 저장에 실패했어요", color = colors.muted)
+        when (page) {
+            Page.SPLASH, Page.INTRO, Page.CONSENT, Page.MASCOT, Page.ATLAS, Page.JOURNEY, Page.ARRIVAL,
+            Page.BOARD, Page.PLACE, Page.REGION -> journey.show(page, body)
+            Page.GARAGE, Page.WORKSHOP, Page.DRESS, Page.RECAP, Page.BOOK, Page.TRANSFER -> collection.show(page, body)
+            Page.SETTINGS -> settings(body)
+            Page.FRIENDS, Page.FRIEND -> friends.show(page, body)
+        }
+        if (oldScroll > 0) window.post { window.scrollTo(0, oldScroll) }
+    }
+
+    private fun driving() {
+        val root = FrameLayout(this).apply { setBackgroundColor(colors.navy) }
+        // Pixel scene keeps rolling while driving: nothing to read or touch, just a sense of moving.
+        root.addView(DriveSceneView(this, art[if (ui.wide) "drive_wide" else "drive_portrait"], colors.night,
+            speed = if (fogo.trip.gear == Gear.DRIVE) 2f else 0f, rain = fogo.trip.scene.rain, headroom = 260f),
+            FrameLayout.LayoutParams(-1, -1))
+        val status = if (fogo.trip.gear == Gear.DRIVE && (fogo.recording || fogo.replayCity != null)) "기록 중"
+            else if (fogo.locationIssue != null) "위치 연결 대기 중" else "정차 후 이용할 수 있어요"
+        val badge = ui.label(status, 25f, colors.white, bold = true).apply {
+            background = ui.box(colors.navy)
+            setPadding(ui.dp(20), ui.dp(12), ui.dp(20), ui.dp(12))
+        }
+        root.addView(badge, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.CENTER_HORIZONTAL)
+            .apply { topMargin = ui.dp(30) })
+        if (fogo.canOpenReplay && fogo.trip.gear == Gear.UNKNOWN) {
+            val button = ui.action("도시 예시 재생", primary = true, click = ::selectReplay)
+            root.addView(button, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL)
+                .apply { bottomMargin = ui.dp(22) })
+        }
+        setContentView(root)
+    }
+
+    fun selectReplay() {
+        if (!fogo.canOpenReplay && !(fogo.parked && fogo.replayCity != null && !fogo.replayRunning)) return
+        val sorted = fogo.cities
+        // FOGO-styled picker (big buttons in two columns) instead of the stock list dialog.
+        val grid = ui.column()
+        ui.grid(grid, sorted.map { city ->
+            ui.action("${city.city} · ${city.spot}", height = TAB) {
+                dialog?.dismiss()
+                journey.focus(city)
+                page = Page.JOURNEY
+                fogo.prepareReplay(city)
+            }
+        }, 2, gap = 8)
+        showSheet("CITY DEMO", "도시 예시 재생", "명소를 고르면 그 도시 주행을 미리 보여 줘요", grid,
+            listOf(Act("닫기") {}), width = ui.fx(1100))
+    }
+
+    fun explainLocation() {
+        if (!fogo.parked) return
+        val missing = locationPermissions.filter { checkSelfPermission(it) != PERMISSION_GRANTED }
+        val asked = permissionPreferences.getBoolean("locationAsked", false)
+        // Android shows no prompt for a permission denied with "다시 묻지 않음", and the car settings have no switch
+        // for Pleos 위치 (FOGO_기술검증_결과.md), so say why instead of a button that silently does nothing.
+        if (asked && locationBlocked()) return showLocationBlocked()
+        val warning = if (asked && missing.isNotEmpty()) " 한 번 더 거부하면 다시 물어볼 수 없고, Pleos 위치는 차량 설정에서도 켤 수 없어요." else ""
+        showSheet("LOCATION", "위치 기록 시작",
+            "차량 위치를 1km 블록으로 바꿔 기기에 저장해요. Android 위치와 Pleos 위치 접근을 허용해 주세요. " +
+                "'알 수 없는 작업 실행'을 묻는 창이 Pleos 위치 접근이에요.$warning",
+            actions = listOf(Act("기록 없이 둘러보기") {}, Act("계속", true, weight = 1.4f) { requestRecording(false) }))
+    }
+
+    fun requestRecording(onboarding: Boolean) {
+        if (!fogo.parked) return
+        permissionFromOnboarding = onboarding
+        val missing = locationPermissions.filter { checkSelfPermission(it) != PERMISSION_GRANTED }
+        // The recording notification ("FOGO 주행 기록") is the only sign that location is being kept, but Android 13+
+        // hides it until POST_NOTIFICATIONS is granted, and it was never asked for. Ask once, alongside location;
+        // recording does not depend on it, so a refusal still records.
+        val notify = listOf(Manifest.permission.POST_NOTIFICATIONS).filter {
+            android.os.Build.VERSION.SDK_INT >= 33 && checkSelfPermission(it) != PERMISSION_GRANTED &&
+                !permissionPreferences.getBoolean("notificationAsked", false)
+        }
+        if (missing.isEmpty() && notify.isEmpty()) return finishPermission()
+        permissionPreferences.edit().apply {
+            if (missing.isNotEmpty()) putBoolean("locationAsked", true)
+            if (notify.isNotEmpty()) putBoolean("notificationAsked", true)
+        }.apply()
+        requestPermissions((missing + notify).toTypedArray(), 7)
+    }
+
+    override fun onRequestPermissionsResult(code: Int, permissions: Array<out String>, results: IntArray) {
+        super.onRequestPermissionsResult(code, permissions, results)
+        if (code != 7) return
+        finishPermission()
+        // Also catches a denial from before this flag existed: the request comes straight back with no prompt.
+        if (locationBlocked()) showLocationBlocked()
+    }
+
+    /** A location permission is denied with "다시 묻지 않음" (only meaningful once it was requested). */
+    private fun locationBlocked() = locationPermissions.any {
+        checkSelfPermission(it) != PERMISSION_GRANTED && !shouldShowRequestPermissionRationale(it)
+    }
+
+    private fun showLocationBlocked() = showSheet("LOCATION", "위치 권한을 다시 물을 수 없어요",
+        "'다시 묻지 않음'으로 거부되어 FOGO가 권한 창을 띄울 수 없어요. Android 위치는 차량 설정 > 앱 > FOGO에서 " +
+            "켤 수 있지만 Pleos 위치는 설정에 항목이 없어, FOGO 앱 저장공간을 지우거나 다시 설치해야 다시 물어봐요. " +
+            "기록 없이도 지도판과 차고는 그대로 쓸 수 있어요.",
+        actions = listOf(Act("확인", true) {}))
+
+    private fun finishPermission() {
+        permissionDenied = locationPermissions.any { checkSelfPermission(it) != PERMISSION_GRANTED }
+        if (!permissionDenied && fogo.parked) {
+            try {
+                startForegroundService(Intent(this, RecordingService::class.java))
+            } catch (error: Exception) {
+                fogo.locationError(error)
+            }
+        }
+        if (permissionFromOnboarding) page = Page.MASCOT
+        permissionFromOnboarding = false
+        render()
+    }
+
+    fun recordingNotice() = if (permissionDenied) "위치 권한 없이 지도판과 차고를 둘러볼 수 있어요." else fogo.locationIssue
+
+    fun stopRecording() {
+        if (fogo.parked) stopService(Intent(this, RecordingService::class.java))
+    }
+
+    private fun settings(body: LinearLayout) {
+        val card = ui.card(body)
+        ui.text(card, if (fogo.hybrid) "음성 합성 · Pleos 하이브리드" else "음성 합성 · 차량 내", bold = true)
+        ui.button(card, if (fogo.hybrid) "차량 내 음성 사용" else "Pleos 하이브리드 음성 사용") {
+            if (fogo.hybrid) fogo.setHybrid() else configureHybrid()
+        }
+        if (fogo.replayAllowed) {
+            ui.text(card, "화면 테마", bold = true)
+            ui.strip(card, listOf("자동" to { chooseTheme(null) },
+                "주간" to { chooseTheme(false) }, "야간" to { chooseTheme(true) }),
+                when (themeOverride) { null -> "자동"; true -> "야간"; false -> "주간" })
+            if (!fogo.replayRunning) ui.button(card, "도시 예시 선택", click = ::selectReplay)
+            ui.button(card, "시연 기록 초기화") {
+                showSheet("DEMO", "시연 기록 초기화", "이 기기에서 모은 방문 기록과 수집품, 차량 선택을 초기화합니다.",
+                    actions = listOf(Act("취소") {}, Act("초기화", true, weight = 1.4f) {
+                        if (fogo.parked) { page = Page.SPLASH; fogo.resetDemo() }
+                    }))
+            }
+        }
+    }
+
+    private fun chooseTheme(value: Boolean?) {
+        if (!fogo.parked || !fogo.replayAllowed) return
+        themeOverride = value
+        themePreferences.edit().putString("demoTheme", value?.toString()).apply()
+        render()
+    }
+
+    private fun configureHybrid() {
+        val fields = ui.column()
+        fun field(label: String, secret: Boolean) = EditText(this).apply {
+            hint = label
+            isSingleLine = true
+            textSize = 18f * ui.scale
+            setTextColor(colors.ink)
+            setHintTextColor(colors.muted)
+            if (secret) inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
+            importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
+            fields.addView(this, LinearLayout.LayoutParams(-1, -2).apply { topMargin = ui.dp(6) })
+        }
+        val id = field("Client ID", false)
+        val secret = field("Client Secret", true)
+        showSheet("HYBRID TTS", "Pleos 하이브리드 음성", "My Project 자격 증명은 실행 중에만 사용합니다.", fields,
+            listOf(Act("취소") { secret.text.clear() }, Act("사용", true, weight = 1.4f) {
+                if (id.text.isNotBlank() && secret.text.isNotBlank()) fogo.setHybrid(id.text.toString().trim(), secret.text.toString())
+                else message("Client ID와 Client Secret을 입력하세요")
+                secret.text.clear()
+            }))
+        dialog?.window?.addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
+    }
+
+    /**
+     * FOGO-styled dialog: a paper card with the app's own type and full-size buttons. Stock dialogs come out
+     * tiny on the car display (mdpi at 2560 × 1440), too small to read or tap. Every action closes the sheet.
+     */
+    fun showSheet(tag: String, title: String, message: String? = null, body: View? = null,
+                  actions: List<Act>, width: Int = ui.fx(900)) {
+        val sheet = ui.column().apply {
+            background = ui.box(colors.paper, shadow = true)
+            setPadding(ui.fx(32), ui.fx(28), ui.fx(32), ui.fx(32))
+        }
+        sheet.addView(ui.label(tag, 11f, colors.muted, pixel = true))
+        ui.text(sheet, title, 25f, bold = true)
+        if (message != null) ui.text(sheet, message, 16f, colors.muted)
+        body?.let { sheet.addView(it, LinearLayout.LayoutParams(-1, -2).apply { topMargin = ui.fx(8) }) }
+        ui.actions(sheet, actions.map { act ->
+            act.copy(click = {
+                dialog?.dismiss()
+                act.click()
+                // The next waiting notice (e.g. 출퇴근 after 차 생일) follows once this sheet is closed.
+                if (fogo.notices.isNotEmpty()) window.decorView.post(::showNextNotice)
+            })
+        }, topMargin = 16)
+        showDialog(AlertDialog.Builder(this).setView(ScrollView(this).apply { addView(sheet) }))
+        dialog?.window?.apply {
+            setBackgroundDrawable(android.graphics.drawable.ColorDrawable(android.graphics.Color.TRANSPARENT))
+            setLayout(width.coerceAtMost(resources.displayMetrics.widthPixels), android.view.ViewGroup.LayoutParams.WRAP_CONTENT)
+        }
+    }
+
+    fun showDialog(builder: AlertDialog.Builder) {
+        dialog?.dismiss()
+        dialog = builder.show()
+    }
+
+    /**
+     * A short notice drawn by the app itself. Toasts never appear on Pleos Connect: FOGO runs as the car user
+     * (user 10) and the system's toast window hides them at once ("Attempt to hide non-current toast"), so every
+     * notice (share, crafting, navi, saving errors) used to vanish. Sits on the decor view so re-renders keep it.
+     */
+    fun message(value: String) {
+        val decor = window.decorView as? FrameLayout ?: return
+        notice?.let { decor.removeView(it) }
+        val view = ui.label(value, 17f, colors.white, bold = true).apply {
+            gravity = Gravity.CENTER
+            background = ui.box(colors.dark, colors.lime, shadow = true)
+            setPadding(ui.dp(28), ui.dp(16), ui.dp(28), ui.dp(16))
+            alpha = 0f
+        }
+        decor.addView(view, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
+            bottomMargin = ui.dp(140)
+        })
+        notice = view
+        view.announceForAccessibility(value)
+        view.animate().alpha(1f).setDuration(150).start()
+        view.postDelayed({
+            view.animate().alpha(0f).setDuration(250).withEndAction {
+                decor.removeView(view)
+                if (notice === view) notice = null
+            }.start()
+        }, 2600)
+    }
+
+    companion object {
+        private val BARCODE = listOf("#.##.#.###.#.##.#.#", "#.##.#.###.#.##.#.#", "#.##.#.###.#.##.#.#")
+        private val locationPermissions = listOf(Manifest.permission.ACCESS_COARSE_LOCATION, "pleos.car.permission.FUSED_LOCATION")
+    }
+}

@@ -1,0 +1,304 @@
+package com.ssafy.fogo
+
+import android.content.Context
+import org.json.JSONObject
+import java.time.LocalDate
+import java.time.YearMonth
+import java.time.temporal.IsoFields
+import kotlin.math.floor
+
+data class TicketBook(
+    val month: YearMonth,
+    val visits: Int,
+    val newRegions: Int,
+    val memory: String?,
+    val stickers: Int?,
+    val boardBefore: Int?,
+    val boardAfter: Int?,
+    val commute: Int? = null,
+    val example: Boolean = false,
+)
+
+class Profile(context: Context, preferenceName: String = "fogo_profile") {
+    private val storage = context.getSharedPreferences(preferenceName, Context.MODE_PRIVATE)
+    private val seed = JSONObject(context.assets.open("demo_profile.json").bufferedReader().use { it.readText() })
+    private var record = load()
+    private val hadRecord get() = storage.contains("record")
+
+    private fun entries(key: String): JSONObject = record.optJSONObject(key) ?: JSONObject()
+
+    val car get() = record.optString("car", seed.getString("car"))
+    val mascot get() = record.optString("mascot", seed.getString("mascot"))
+    val onboarded get() = if (record.has("onboarded")) record.optBoolean("onboarded") else hadRecord
+    val garage get() = (listOf(car) + entries("garage").keys().asSequence().toList()).distinct()
+    val blocks get() = entries("blocks").keys().asSequence().toSet()
+    val placements get() = entries("board").let { it.keys().asSequence().associateWith(it::getString) }
+    val ownedCount get() = entries("stickers").length() + entries("magnets").length()
+    val costumeCount get() = entries("costumes").length() + (if (legacyHat()) 1 else 0)
+
+    private fun legacyHat() = !record.has("costumes") && record.optString("costume", seed.getString("costume")) == "픽셀 비니"
+    fun ownsCostume(id: String) = entries("costumes").has(id) || (id == "CST_PIXEL_BEANIE" && legacyHat())
+    fun equipped(slot: String): String? = entries("equipped").optString(slot).ifBlank {
+        if (slot == "hat" && !record.has("equipped") && legacyHat()) "CST_PIXEL_BEANIE" else return null
+    }
+
+    fun opened(city: City) = owns(city.stickerId)
+    fun owns(item: String) = entries("stickers").has(item) || entries("magnets").has(item)
+    fun visited(city: City) = entries("spots").has(city.spotId)
+    fun materialCount(city: City) = materialCount(city.materialId)
+    fun materialCount(id: String) = entries("materials").optInt(id, seed.optJSONObject("materials")?.optInt(id) ?: 0)
+    fun stickerBlock(city: City) = placements[city.stickerId]
+    fun visitDate(city: City): String? = entries("spots").optJSONObject(city.spotId)?.optString("day")
+    fun visitTags(city: City): String? = entries("spots").optJSONObject(city.spotId)?.optString("tags")
+
+    /**
+     * The spot reached just before [city]: "spots" keeps first visits in the order they happened. Picking the latest
+     * visit date tied on same-day visits and always returned the first city in the list (FROM 강릉 on every ticket).
+     */
+    fun visitedBefore(city: City, cities: List<City>): City? {
+        val order = entries("spots").keys().asSequence().toList()
+        val previous = order.indexOf(city.spotId).let { if (it < 0) order.lastOrNull() else order.getOrNull(it - 1) }
+        return cities.firstOrNull { it.spotId == previous }
+    }
+    fun newBlocksToday(day: LocalDate = LocalDate.now()) =
+        entries("blockDays").let { table -> table.keys().asSequence().count { table.optString(it) == day.toString() } }
+
+    // 친구 (demo: friends come from assets/friends.json; this keeps who is a friend and what I sent them)
+    val friendCode: String get() = record.optString("code", seed.optString("code", "000000"))
+    fun isFriend(id: String) = entries("friends").has(id)
+    fun requestedFriend(id: String) = entries("friendRequests").has(id)
+    fun requestFriend(id: String, day: LocalDate = LocalDate.now()): Boolean =
+        !isFriend(id) && update { table("friendRequests").put(id, day.toString()) }
+    fun acceptFriend(id: String, day: LocalDate = LocalDate.now()): Boolean {
+        if (!requestedFriend(id)) return isFriend(id)
+        return update {
+            table("friendRequests").remove(id)
+            table("friends").put(id, day.toString())
+        }
+    }
+    fun reaction(id: String): String? = entries("reactions").optString(id).ifBlank { null }
+    fun react(id: String, sticker: String) = isFriend(id) && update { table("reactions").put(id, sticker) }
+    fun blockDays(): Map<String, String> = entries("blockDays").let { it.keys().asSequence().associateWith(it::getString) }
+
+    // 차 생일: every [BIRTHDAY_KM] of the odometer. Milestones already behind the car when FOGO first saw it are not celebrated.
+    fun birthdays() = entries("birthdays").keys().asSequence().mapNotNull(String::toIntOrNull).sorted().toList()
+    fun nextBirthday(km: Double) = ((floor(km / BIRTHDAY_KM).toInt() + 1) * BIRTHDAY_KM)
+
+    /** Records the odometer; returns the milestone (km) to celebrate now, if this reading just passed one. */
+    fun noteOdometer(km: Double, day: LocalDate = LocalDate.now()): Int? {
+        if (km < 0 || km.isNaN()) return null
+        if (!record.has("odometerBase")) {
+            update { put("odometerBase", km) }
+            return null
+        }
+        val milestone = floor(km / BIRTHDAY_KM).toInt() * BIRTHDAY_KM
+        if (milestone <= 0 || milestone <= record.optDouble("odometerBase", km) || entries("birthdays").has("$milestone")) return null
+        val celebrated = update {
+            table("birthdays").put("$milestone", day.toString())
+            table("stickers").put(BIRTHDAY_STICKER, true)
+            table("materials").put(LIMITED, materialCount(LIMITED) + 1)
+        }
+        return milestone.takeIf { celebrated }
+    }
+
+    /** Starts the odometer over from [km] (demo reset), so the next milestone after it is the next birthday. */
+    fun rebaseOdometer(km: Double?) = km == null || update { put("odometerBase", km) }
+
+    // 출퇴근 루틴: two registered places; a drive that ends near one after starting near the other counts.
+    fun place(name: String): Point? = entries("places").optString(name).split(',').let { parts ->
+        val lat = parts.getOrNull(0)?.toDoubleOrNull()
+        val lon = parts.getOrNull(1)?.toDoubleOrNull()
+        if (lat != null && lon != null) Point(lat, lon) else null
+    }
+    fun setPlace(name: String, point: Point) = update { table("places").put(name, "${point.latitude},${point.longitude}") }
+    fun commutes(day: LocalDate = LocalDate.now()) = entries("commutes").optInt(week(day))
+    val commuteDone get() = entries("commuteRewards").length() > 0
+
+    /** Counts one commute; true when it completes this week's routine (and pays its reward). */
+    fun addCommute(day: LocalDate = LocalDate.now()): Boolean {
+        val key = week(day)
+        val count = commutes(day) + 1
+        val reward = count >= COMMUTE_GOAL && !entries("commuteRewards").has(key)
+        val saved = update {
+            table("commutes").put(key, count)
+            if (reward) {
+                table("commuteRewards").put(key, true)
+                table("stickers").put(COMMUTE_STICKER, true)
+                table("materials").put(COMMON, materialCount(COMMON) + COMMUTE_MATERIALS)
+            }
+        }
+        return saved && reward
+    }
+
+    /** Demo: this week's count, so one real drive can finish the routine on stage. */
+    fun setCommutes(count: Int, day: LocalDate = LocalDate.now()) = update { table("commutes").put(week(day), count) }
+
+    private fun week(day: LocalDate) = "%d-W%02d".format(day.get(IsoFields.WEEK_BASED_YEAR), day.get(IsoFields.WEEK_OF_WEEK_BASED_YEAR))
+
+    fun completeOnboarding(name: String) = update { put("onboarded", true); put("mascot", name) }
+    fun selectMascot(name: String) = update { put("mascot", name) }
+
+    fun addBlock(block: Block, day: LocalDate = LocalDate.now()): Boolean {
+        if (entries("blocks").has(block.id)) return true
+        return update { recordBlock(block, day.toString()) }
+    }
+
+    fun arrive(arrival: Arrival, block: Block): Boolean {
+        val city = arrival.city
+        if (visited(city)) return true
+        return update {
+            recordBlock(block, arrival.day)
+            table("spots").put(city.spotId, JSONObject().put("day", arrival.day).put("tags", arrival.tags.summary())
+                .put("newRegion", arrival.sticker))
+            if (arrival.sticker) table("stickers").put(city.stickerId, true)
+            if (arrival.material) table("materials").put(city.materialId, materialCount(city) + 1)
+            if (arrival.magnet) table("magnets").put(city.magnetId, true)
+        }
+    }
+
+    fun updateTags(arrival: Arrival): Boolean = update {
+        table("spots").getJSONObject(arrival.city.spotId).put("tags", arrival.tags.summary())
+    }
+
+    fun place(city: City, block: String) = place(city.stickerId, block)
+
+    fun place(item: String, block: String, day: LocalDate = LocalDate.now()): Boolean {
+        val board = placements
+        if (!owns(item) || block !in blocks || board.any { it.key != item && it.value == block }) return false
+        if (board[item] == block) return true
+        return update {
+            table("board").put(item, block)
+            if (item.startsWith("STK_")) table("monthlyPlacements").table(YearMonth.from(day).toString()).put(item, true)
+        }
+    }
+
+    fun canCraft(costume: Costume) = !ownsCostume(costume.id) && costume.cost.all { materialCount(it.key) >= it.value }
+
+    fun craft(costume: Costume): Boolean {
+        if (!canCraft(costume)) return false
+        return update {
+            val inventory = table("materials")
+            costume.cost.forEach { (id, amount) -> inventory.put(id, materialCount(id) - amount) }
+            table("costumes").put(costume.id, true)
+        }
+    }
+
+    fun equip(costume: Costume?, slot: String): Boolean {
+        if (costume != null && (costume.slot != slot || !ownsCostume(costume.id))) return false
+        return update {
+            val equipped = table("equipped")
+            if (costume == null) equipped.remove(slot) else equipped.put(slot, costume.id)
+        }
+    }
+
+    fun changeCar(name: String): Boolean {
+        if (name == car) return true
+        return update { table("garage").put(car, true); put("car", name) }
+    }
+
+    fun books(today: LocalDate = LocalDate.now()): List<TicketBook> {
+        val reference = YearMonth.from(today)
+        fun example(row: JSONObject, offset: Long) = TicketBook(
+            reference.minusMonths(offset), row.optInt("visits", 6), row.optInt("regions"),
+            row.optString("memory"), row.optInt("stickers"), row.optInt("before", 24),
+            row.optInt("after", 48), row.optInt("commute", 18), true,
+        )
+        val samples = seed.optJSONArray("recapSamples")
+        val examples = listOf(example(record.optJSONObject("recap") ?: seed.getJSONObject("recap"), 2)) +
+            List(samples?.length() ?: 0) { index ->
+                val row = checkNotNull(samples).getJSONObject(index)
+                example(row, row.getLong("offset"))
+            }
+        val snapshots = entries("books")
+        val actual = snapshots.keys().asSequence().map { key ->
+            val row = snapshots.getJSONObject(key)
+            TicketBook(YearMonth.parse(key), row.getInt("visits"), row.getInt("regions"),
+                row.optString("memory").ifBlank { null }, row.optInt("stickers", -1).takeIf { it >= 0 },
+                row.optInt("before", -1).takeIf { it >= 0 }, row.optInt("after", -1).takeIf { it >= 0 })
+        }.toList()
+        return (actual + examples.filter { demo -> actual.none { it.month == demo.month } })
+            .sortedByDescending { it.month }
+    }
+
+    fun closePreviousMonth(cities: List<City>, today: LocalDate = LocalDate.now()): Boolean {
+        val month = YearMonth.from(today).minusMonths(1)
+        val key = month.toString()
+        if (entries("books").has(key)) return true
+        val visits = cities.filter { visitDate(it)?.startsWith(key) == true }
+        val months = entries("monthlyPlacements")
+        val placements = months.optJSONObject(key)?.length() ?: 0
+        val datedStickers = months.keys().asSequence().flatMap { months.getJSONObject(it).keys().asSequence() }.toSet()
+        val unknownDates = this.placements.keys.any { it.startsWith("STK_") && it !in datedStickers }
+        val known = entries("blockDays")
+        val days = known.keys().asSequence().map(known::getString).toList()
+        if (visits.isEmpty() && placements == 0 && days.none { it.startsWith(key) }) return true
+        val first = month.atDay(1).toString()
+        val last = month.atEndOfMonth().toString()
+        // Representative memory: the visit with the most 상황 태그. "맑은 날" is only the no-tag default, never observed
+        // weather, so it counts as none and is left out of the line (a one-tag visit used to tie with it).
+        fun observed(city: City) = visitTags(city)?.takeUnless { it.isBlank() || it == TripTags().summary() }
+        val memory = visits.maxByOrNull { city -> observed(city)?.let { it.count { char -> char == '·' } + 1 } ?: 0 }
+        val summary = JSONObject().put("visits", visits.size)
+            .put("regions", visits.groupBy(City::regionId).count { (_, matches) ->
+                val firstDay = cities.filter { it.regionId == matches.first().regionId }.mapNotNull(::visitDate).minOrNull()
+                firstDay?.startsWith(key) == true
+            })
+        if (placements > 0 || !unknownDates) summary.put("stickers", placements)
+        if (memory != null) summary.put("memory", listOfNotNull(observed(memory), memory.spot).joinToString(" · "))
+        if (days.isNotEmpty()) summary.put("before", days.count { it < first }).put("after", days.count { it <= last })
+        return update { table("books").put(key, summary) }
+    }
+
+    /**
+     * The saved record, or the seed. Profile is built in FogoApplication.onCreate, so an unreadable record used to
+     * crash the app on every launch until its data was cleared: keep the broken text aside and start from the seed.
+     */
+    private fun load(): JSONObject {
+        val saved = storage.getString("record", null) ?: return JSONObject(seed.toString())
+        return runCatching { JSONObject(saved) }.getOrElse {
+            storage.edit().putString("record_unreadable", saved).apply()
+            JSONObject(seed.toString())
+        }
+    }
+
+    fun reset(): Boolean {
+        if (!storage.edit().remove("record").commit()) return false
+        record = JSONObject(seed.toString())
+        return true
+    }
+
+    private fun update(change: JSONObject.() -> Unit): Boolean {
+        val copy = JSONObject(record.toString()).apply {
+            if (!has("onboarded")) put("onboarded", onboarded)
+            if (!has("mascot")) put("mascot", mascot)
+            if (legacyHat()) {
+                table("costumes").put("CST_PIXEL_BEANIE", true)
+                table("equipped").put("hat", "CST_PIXEL_BEANIE")
+            }
+            change()
+        }
+        if (!storage.edit().putString("record", copy.toString()).commit()) return false
+        record = copy
+        return true
+    }
+
+    private fun JSONObject.recordBlock(block: Block, day: String) {
+        val table = table("blocks")
+        if (table.has(block.id)) return
+        table.put(block.id, true)
+        table("blockDays").put(block.id, day)
+    }
+
+    private fun JSONObject.table(key: String): JSONObject = optJSONObject(key)
+        ?: JSONObject().also { put(key, it) }
+
+    companion object {
+        const val BIRTHDAY_KM = 10_000
+        const val BIRTHDAY_STICKER = "STK_BIRTHDAY"
+        const val COMMUTE_STICKER = "STK_COMMUTE"
+        const val COMMUTE_GOAL = 5
+        const val COMMUTE_MATERIALS = 2
+        private const val LIMITED = "MAT_LIMITED"
+        private const val COMMON = "MAT_COMMON"
+    }
+}
