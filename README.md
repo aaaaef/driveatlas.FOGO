@@ -4,6 +4,8 @@
 
 FOGO는 Pleos Connect(Android Automotive)용 차량 앱입니다. 주행한 길을 1km 블록으로만 기록해 안개 지도를 걷고, 명소에 처음 도착하면 탑승권과 수집품을 줍니다. 아이와 함께 지도판을 꾸미고, 친구 가족과 지도를 나누고, 다음 차에서도 기록을 이어 갑니다.
 
+▶ **시연 영상 (3분 55초)**: [docs/FOGO_demo_video.mp4](docs/FOGO_demo_video.mp4) — Pleos Connect v2.1.0 에뮬레이터와 Virtual Console 화면 녹화
+
 | 주행 중 | 도착 탑승권 |
 | --- | --- |
 | ![주행 중: 화면을 잠그고 기록만](docs/images/drive.png) | ![도착 탑승권: 경포대 도착 · 비 오는 날 · 밤 · 가족과](docs/images/ticket.png) |
@@ -122,7 +124,7 @@ Virtual Console 페이지는 열리지만 차량 제어가 `503 emulator_inactiv
 
 기본 음성은 Pleos 차량 내 한국어 합성입니다. 설정에서 Pleos My Project 자격 증명을 입력하면 해당 앱 프로세스에서 하이브리드 음성을 사용할 수 있습니다. 자격 증명은 APK·파일·앱 설정에 저장하지 않습니다. SDK 재생이 시작되지 않으면 한국어 내장 음원을 재생합니다.
 
-시연 기록은 기기 내부에만 저장합니다. 지도판은 등록 경로 주변의 1km 격자이며, 명소 좌표는 시연용 근삿값입니다. 개발 과정과 검증 결과는 [RECORD.md](RECORD.md)에 있습니다.
+시연 기록은 기기 내부에만 저장합니다. 지도판은 등록 경로 주변의 1km 격자이며, 명소 좌표는 시연용 근삿값입니다. 에뮬레이터 실측 결과는 [docs/기술검증_결과.md](docs/기술검증_결과.md)에 있습니다.
 
 
 ## 테스트
@@ -130,6 +132,18 @@ Virtual Console 페이지는 열리지만 차량 제어가 `503 emulator_inactiv
 - 도착 판정·음성 대체·로컬 데이터 회귀 테스트는 `assembleDebugAndroidTest`로 빌드합니다. 시연 APK와 테스트 APK를 같은 Pleos AVD에 설치하고 `adb -s emulator-5580 shell am instrument --user 10 -w com.ssafy.fogo.test/androidx.test.runner.AndroidJUnitRunner`를 실행합니다. 사용자 ID가 다른 AVD에서는 `adb shell am get-current-user`로 확인한 값을 사용합니다.
 - 세 도시 재생, 강원 자석, 공방, 티켓북, 차량 이전 UI는 `python scripts/test_demo.py --reset`으로 검증합니다. 이 명령은 지정한 에뮬레이터의 FOGO 앱 데이터를 초기화합니다.
 - 2026-11-15 기준: 계측 테스트 17건 통과, `test_demo.py` 7단계 통과(Pleos Connect v2.1.0 AVD).
+
+## 저장소 구성
+
+| 경로 | 내용 |
+| --- | --- |
+| `apk/` | 심사용 release APK |
+| `app/` | 앱 소스(Kotlin)·리소스·계측 테스트 |
+| `docs/FOGO_demo_video.mp4` | 시연 영상 |
+| `docs/images/` | README 화면 캡처·핵심 흐름 그림 |
+| `docs/기술검증_결과.md` | 별첨 1. Pleos SDK·에뮬레이터 실측 결과 |
+| `docs/콘텐츠시트.xlsx` | 별첨 2. 명소·보상표·문구 콘텐츠 시트 |
+| `scripts/` | 위치 재생(`replay_location.py`), 시연 흐름 자동 검증(`test_demo.py`) |
 
 ## 오픈소스·글꼴 출처
 
@@ -141,4 +155,4 @@ Virtual Console 페이지는 열리지만 차량 제어가 `503 emulator_inactiv
 | [ZXing core 3.5.3](https://github.com/zxing/zxing) | 탑승권·친구 코드 QR 생성 | Apache License 2.0 · `app/src/main/assets/licenses/zxing.txt` |
 | Pleos Playground SDK (Vehicle, FusedLocation, NaviHelper, TextToSpeech) | 차량 신호·위치·내비·음성 | Pleos 개발자 약관 |
 
-시연용 도착 음원(`res/raw/arrival_*.wav`)은 Windows 한국어 음성(Heami)으로 생성했고, 오프닝 영상(`res/raw/fogo_intro.mp4`)은 `scripts/intro/render_intro.py`로 직접 렌더했습니다.
+시연용 도착 음원(`res/raw/arrival_*.wav`)은 Windows 한국어 음성(Heami)으로 생성했고, 오프닝 영상(`res/raw/fogo_intro.mp4`)은 팀이 직접 렌더했습니다.
